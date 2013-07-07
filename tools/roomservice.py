@@ -4,9 +4,15 @@ import sys
 import urllib2
 import json
 import re
+import netrc, base64
 from xml.etree import ElementTree
 
 product = sys.argv[1];
+local_manifests_dir = ".repo/local_manifests"
+default_revison = "jellybean"
+dependency_filename = 'ev.dependencies'
+repositories = []
+local_manifests = []
 
 if len(sys.argv) > 2:
     depsonly = sys.argv[2]
@@ -21,22 +27,37 @@ except:
 if not depsonly:
     print "Device %s not found. Attempting to retrieve device repository from Evervolv Github (http://github.com/Evervolv)." % device
 
-local_manifest_dir = ".repo/local_manifests"
-local_manifest = os.path.join(local_manifest_dir, "kernels.xml")
-
 try: # Convert from depreciated format
-    if not os.path.isdir(local_manifest_dir):
-        os.makedirs(local_manifest_dir)
+    if not os.path.isdir(local_manifests_dir):
+        os.makedirs(local_manifests_dir)
     if os.path.exists(".repo/local_manifest.xml"):
-        os.rename(".repo/local_manifest.xml",local_manifest)
+        os.rename(".repo/local_manifest.xml", os.path.join(local_manifests_dir, "deprecated_manifest.xml"))
 except OSError as e:
     print "Fatal: %s" % e
     sys.exit()
 
-repositories = []
+# list the currently existing manifests
+local_manifests = os.listdir(local_manifests_dir)
+
+try:
+    authtuple = netrc.netrc().authenticators("api.github.com")
+
+    if authtuple:
+        githubauth = base64.encodestring('%s:%s' % (authtuple[0], authtuple[2])).replace('\n', '')
+    else:
+        githubauth = None
+except:
+    githubauth = None
+
+def add_auth(githubreq):
+    if githubauth:
+        githubreq.add_header("Authorization","Basic %s" % githubauth)
+
 page = 1
 while not depsonly:
-    result = json.loads(urllib2.urlopen("https://api.github.com/users/Evervolv/repos?per_page=100&page=%d" % page).read())
+    githubreq = urllib2.Request("https://api.github.com/users/Evervolv/repos?per_page=100&page=%d" % page)
+    add_auth(githubreq)
+    result = json.loads(urllib2.urlopen(githubreq).read())
     if len(result) == 0:
         break
     for res in result:
@@ -66,15 +87,16 @@ def indent(elem, level=0):
             elem.tail = i
 
 def get_from_manifest(devicename):
-    try:
-        lm = ElementTree.parse(local_manifest)
-        lm = lm.getroot()
-    except:
-        lm = ElementTree.Element("manifest")
+    for manifest in local_manifests:
+        try:
+            lm = ElementTree.parse(os.path.join(local_manifests_dir, manifest))
+            lm = lm.getroot()
+        except:
+            lm = ElementTree.Element("manifest")
 
-    for localpath in lm.findall("project"):
-        if re.search("android_device_.*_%s$" % device, localpath.get("name")):
-            return localpath.get("path")
+        for localpath in lm.findall("project"):
+            if re.search("android_device_.*_%s$" % device, localpath.get("name")):
+                return localpath.get("path")
 
     # Devices originally from AOSP are in the main manifest...
     try:
@@ -90,26 +112,32 @@ def get_from_manifest(devicename):
     return None
 
 def is_in_manifest(projectname):
-    try:
-        lm = ElementTree.parse(local_manifest)
-        lm = lm.getroot()
-    except:
-        lm = ElementTree.Element("manifest")
+    for manifest in local_manifests:
+        try:
+            lm = ElementTree.parse(os.path.join(local_manifests_dir, manifest))
+            lm = lm.getroot()
+        except:
+            lm = ElementTree.Element("manifest")
 
-    for localpath in lm.findall("project"):
-        if localpath.get("name") == projectname:
-            return 1
+        for localpath in lm.findall("project"):
+            if localpath.get("name") == projectname:
+                return 1
 
     return None
 
 def add_to_manifest(repositories):
-    try:
-        lm = ElementTree.parse(local_manifest)
-        lm = lm.getroot()
-    except:
-        lm = ElementTree.Element("manifest")
-
     for repository in repositories:
+        if 'dep_type' in repository:
+            dep_manifest = os.path.join(local_manifests_dir, repository['dep_type'] + ".xml")
+        else:
+            print 'dep_type not found, assuming device tree, otherwise please update your ev.dependencies config'
+            dep_manifest = os.path.join(local_manifests_dir, "device.xml")
+        try:
+            lm = ElementTree.parse(dep_manifest)
+            lm = lm.getroot()
+        except:
+            lm = ElementTree.Element("manifest")
+
         repo_name = repository['repository']
         repo_target = repository['target_path']
         if exists_in_tree(lm, repo_name):
@@ -122,43 +150,84 @@ def add_to_manifest(repositories):
 
         if 'branch' in repository:
             project.set('revision',repository['branch'])
+        else:
+            project.set('revision',default_revison)
 
         lm.append(project)
 
-    indent(lm, 0)
-    raw_xml = ElementTree.tostring(lm)
-    raw_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw_xml
+        indent(lm, 0)
+        raw_xml = ElementTree.tostring(lm)
+        raw_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw_xml
 
-    f = open(local_manifest, 'w')
-    f.write(raw_xml)
-    f.close()
+        f = open(dep_manifest, 'w')
+        f.write(raw_xml)
+        f.close()
+
+def fetch_repos(repos):
+    '''Adds repo to manifest and syncs'''
+
+    fetch_list = []
+    for r in repos:
+        if not is_in_manifest('%s' % r.get('repository')):
+            fetch_list.append(r)
+
+    if fetch_list:
+        add_to_manifest(fetch_list)
+        repo_paths = ' '.join([ r.get('target_path') for r in fetch_list ])
+        print 'Syncing', repo_paths
+        os.system('repo sync -f %s' % repo_paths)
+
+def fetch_children(repos):
+    '''Locate any device dependencies'''
+
+    children = []
+    for r in repos:
+        if r.get('dep_type') == 'device':
+            try:
+                with open(os.path.join(r.get('target_path'),dependency_filename)) as f:
+                    #print r.get('target_path')
+                    children.extend(json.load(f))
+            except IOError:
+                continue
+    fetch_repos(children)
+    return children
+
+def fetch_vendors(repo_path):
+    '''Add the proper vendor dependency'''
+
+    vendor = repo_path.split('/')[1]
+    vendor_repos = [
+        {
+            'target_path': 'vendor/%s' % vendor,
+            'repository' : 'android_vendor_%s' % vendor,
+            'dep_type'   : 'vendor'
+        },
+    ]
+    fetch_repos(vendor_repos)
 
 def fetch_dependencies(repo_path):
-    print 'Looking for dependencies'
-    dependencies_path = repo_path + '/ev.dependencies'
-    syncable_repos = []
+    '''Add any and all dependencies found'''
 
-    if os.path.exists(dependencies_path):
-        dependencies_file = open(dependencies_path, 'r')
-        dependencies = json.loads(dependencies_file.read())
-        fetch_list = []
+    dependencies = []
 
-        for dependency in dependencies:
-            if not is_in_manifest("%s" % dependency['repository']):
-                fetch_list.append(dependency)
-                syncable_repos.append(dependency['target_path'])
+    try:
+        with open(os.path.join(repo_path,dependency_filename)) as f:
+            dependencies = json.load(f)
+    except IOError as e:
+        print e
 
-        dependencies_file.close()
+    # Fetch toplevel dependencies
+    fetch_repos(dependencies)
 
-        if len(fetch_list) > 0:
-            print 'Adding dependencies to manifest'
-            add_to_manifest(fetch_list)
-    else:
-        print 'Dependencies file not found, bailing out.'
+    # Locate any extra dependencies
+    children = dependencies
+    while True:
+        children = fetch_children(children)
+        if not children:
+            break
 
-    if len(syncable_repos) > 0:
-        print 'Syncing dependencies'
-        os.system('repo sync %s' % ' '.join(syncable_repos))
+    # Fetch vendor dependencies
+    fetch_vendors(repo_path)
 
 if depsonly:
     repo_path = get_from_manifest(device)
@@ -178,10 +247,12 @@ else:
 
             repo_path = "device/%s/%s" % (manufacturer, device)
 
-            add_to_manifest([{'repository':repo_name,'target_path':repo_path}])
+            add_to_manifest([{'repository':repo_name,
+                              'target_path':repo_path,
+                              'dep_type':'device'}])
 
             print "Syncing repository to retrieve project."
-            os.system('repo sync %s' % repo_path)
+            os.system('repo sync -f %s' % repo_path)
             print "Repository synced!"
 
             fetch_dependencies(repo_path)
